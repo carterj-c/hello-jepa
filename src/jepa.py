@@ -170,6 +170,7 @@ def train_jepa(
     inv_coeff: float = 25.0,
     var_coeff: float = 15.0,
     cov_coeff: float = 1.0,
+    on_epoch_end=None,
 ) -> tuple[nn.Module, list[dict]]:
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -257,6 +258,9 @@ def train_jepa(
             "eff_rank": eff_rank,
         }
         metrics_history.append(record)
+
+        if on_epoch_end is not None:
+            on_epoch_end(epoch, context_encoder)
 
         if verbose:
             print(

@@ -96,30 +96,97 @@ better — is **wrong**. PCA-whitening the embeddings before probing changes not
 (0.765 → 0.764 for cov=1; 0.747 → 0.745 for cov=0). The covariance term is
 preserving real information, not just improving conditioning.
 
-## Prediction MSE is a confounded metric here
+## Why prediction MSE is the wrong yardstick
 
 ![prediction MSE](figures/sweep/sweep_prediction_mse.png)
 
-Every run's MSE **bottoms out at epoch 1–3 and then gets worse**, while effective
-rank climbs over the same span:
+Every run's MSE **bottoms out at epoch 1-3 and then gets worse**, while effective
+rank climbs. Probing at each epoch shows what that actually means:
 
-| run | best MSE | @ epoch | final MSE | eff_rank (best → final) |
+| epoch | pred MSE | eff_rank | acc | bear-v-kang |
 |---|---|---|---|---|
-| baseline | 0.773 | 1 | 0.909 | 5.6 → 13.6 |
-| cov ×0.1 | 0.401 | 2 | 0.679 | 6.6 → 12.0 |
-| cov ×0.01 | 0.323 | 3 | 0.628 | 7.7 → 12.4 |
-| cov ablated | 0.320 | 3 | 0.630 | 7.6 → 12.0 |
+| 0 | 0.960 | 4.31 | 0.740 | 0.710 |
+| **1** | **0.773** (minimum) | 5.55 | **0.735** | 0.711 |
+| 3 | 0.842 | 7.49 | 0.742 | 0.706 |
+| 10 | 0.847 | 11.47 | 0.751 | 0.705 |
+| 20 | 0.873 | 13.23 | 0.763 | 0.710 |
+| **29** | **0.909** (worst) | 13.60 | **0.765** | 0.708 |
+| *random-init null* | — | — | *0.735* | *0.713* |
 
-The target is not fixed — it is the EMA encoder's own output, and its richness grows
-during training. A low MSE against a rank-6 target is not better than a higher MSE
-against a rank-13 target; it may simply mean there is less to predict. This is the
-same trade visible across the sweep: shrinking `cov_coeff` lowers MSE *and* lowers
-effective rank *and* lowers probe accuracy, together.
+**The MSE minimum is exactly where the representation is worst.** At epoch 1 the
+probe scores 0.735 — identical to an untrained network. Accuracy improves
+monotonically as MSE degrades. Early stopping on the loss would pick the worst
+checkpoint available.
 
-**So the original "the predictor explains only 9.1% of target variance" framing was
-itself misleading**, and this sweep is what exposed it. Raw MSE cannot be compared
-across runs or across epochs while target rank is moving. Any future progress metric
-has to be rank-normalized, or measured against a frozen target.
+### Effective rank, and why more of it costs MSE
+
+Effective rank is a soft count of how many independent directions the
+representation uses: centre the (N x 128) embedding matrix, take singular values
+s_i, normalise p_i = s_i / sum(s), then eff_rank = exp(-sum p_i log p_i). All
+variance in one direction gives 1; spread evenly over all 128 gives 128. This
+model ends at ~13.6, so it uses about 14 of its 128 available directions.
+
+The target is **not fixed** — it is the EMA encoder's own output, so the model sets
+its own exam, and the exam's difficulty is its rank. At rank 5 the 128 coordinates
+are highly redundant: pin down ~5 numbers and the rest follow. At rank 14 there are
+~14 independent quantities to get right, each still forced to unit variance by the
+variance term. More independent things to predict at the same per-dimension
+variance means higher MSE.
+
+The degenerate limit makes it obvious: at rank 1 every dimension is the same number
+up to scale, and a constant predictor scores MSE -> 0. That is collapse — a perfect
+score for a worthless representation. What the sweep shows is the mild, continuous
+version of the same pressure.
+
+So the model always has an incentive to lower its loss by simplifying its own
+target, and **the variance and covariance terms exist to fight exactly that**.
+Rising MSE is the sign they are winning. It also explains the sweep: ablating `cov`
+removed the force pushing rank up, the target got easier, MSE fell 31%, and the
+representation got poorer.
+
+## Which channels carry the signal — and which the predictor is paid to predict
+
+Single-channel probes against each channel's one-step predictability:
+
+| channel | lag-1 autocorr | 1-step R² | probe acc | bear-v-kang |
+|---|---|---|---|---|
+| log_ret | −0.095 | **0.009** | 0.610 | 0.703 |
+| realized_vol | 0.992 | 0.983 | **0.804** | 0.692 |
+| log_vol | 0.865 | 0.749 | 0.653 | 0.709 |
+| slow | 0.989 | **0.979** | **0.595** | 0.692 |
+
+Chance is 0.606. **The `slow` channel scores 0.595 — below chance, i.e. zero regime
+information — while being 97.9% predictable one step ahead.** It is
+regime-independent by construction (`B_SLOW` is a single dict with no state
+lookup), so this is the design working as intended, but it hands the predictor a
+free lunch: a quarter of the input channels can be nailed almost perfectly while
+teaching the encoder nothing.
+
+Worse, the slow channel is near-constant *within* a window. Its AR(1) time constant
+is 100 steps against a 64-step window:
+
+| channel | within-window sd | across-window sd | ratio |
+|---|---|---|---|
+| log_ret | 0.912 | 0.135 | 6.75 |
+| realized_vol | 0.486 | 0.819 | 0.59 |
+| log_vol | 0.831 | 0.506 | 1.64 |
+| slow | 0.419 | 0.894 | **0.47** |
+
+A ratio below 1 means the channel varies more between windows than inside one — it
+presents as a fixed offset rather than a process the model can watch evolve.
+
+The inversion is the point. `log_ret` carries the temporal signature that separates
+bear from kangaroo, and it is by far the *least* predictable channel (R² = 0.009).
+`slow` is almost perfectly predictable and carries nothing. **A latent-prediction
+objective is rewarded for modelling `slow` and for ignoring `log_ret`** — precisely
+backwards for the task we are probing.
+
+The one channel that breaks the pattern is `realized_vol`, which is both highly
+predictable (R² = 0.983) and the single most informative channel for overall
+accuracy (0.804 alone, against 0.817 for all four together). But it scores 0.692 on
+bear-vs-kangaroo — exactly chance. So it supplies the easy bull-vs-rest split and
+nothing else, which is consistent with the JEPA's overall accuracy improving over
+training while its bear-vs-kangaroo score never moves.
 
 ## Not collapse
 
@@ -150,20 +217,48 @@ probes and controls in place, runs versioned and reproducible. It produced an ho
 negative result and then falsified its own first explanation for that result, which
 is what a smoke test is for.
 
+## The masking scheme
+
+The encoder splits each 64-step window into **8 non-overlapping patches of 8
+timesteps**. Each patch flattens its 8x4 = 32 values through `nn.Linear(32, 128)`,
+picks up a learned positional embedding, and passes through a 4-layer transformer.
+Training samples **one contiguous target block of 2-4 patches** (16-32 timesteps),
+uses the remaining 4-6 patches as context, and asks a 2-layer predictor to
+reconstruct the target patches' *embeddings* from the context plus learned mask
+tokens. The same block is used for the whole batch.
+
+**Patch length is not what blocks the autocorrelation signal.** 8 timesteps gives 7
+consecutive pairs and the full window gives 63, which is ample to estimate a lag-1
+correlation whose true magnitude is 0.30-0.35. The transformer's attention and MLP
+layers are nonlinear and can compute the required products; `Linear(32, 128)` is an
+expansion, so no information is destroyed at the patch-embedding step.
+
+What is missing is **incentive**. Nothing in the objective rewards computing a
+second-order statistic, and per the channel table above the objective actively
+rewards the opposite: modelling the near-constant, uninformative `slow` channel
+instead of the noisy, informative `log_ret` one.
+
 ## Next steps
 
 Ranked by what would actually change the answer:
 
-1. **Stop training at the MSE minimum (epoch 2–3) and probe there.** The cheapest
-   test of whether late training is destroying the representation. Currently every
-   probe is taken at epoch 29, well past the point where prediction peaked.
-2. **Fix the progress metric before tuning anything else.** Rank-normalize the
-   prediction loss, or evaluate against a frozen target encoder, so MSE across runs
-   becomes comparable. Right now there is no trustworthy scalar to tune against.
-3. **Revisit the masking scheme.** 8 patches with a 2–4 patch target block may leave
-   too little context; the same block is used for the whole batch.
+1. **Drop or shorten the `slow` channel.** It is regime-independent, scores below
+   chance on its own, is 97.9% predictable, and is near-constant within a 64-step
+   window (time constant 100 steps). It is free loss reduction that teaches the
+   encoder nothing. Either remove it, or lengthen the window past its time constant
+   so it presents as a process rather than an offset.
+2. **Make the prediction target something autocorrelation-bearing.** The current
+   objective can be satisfied without ever representing the sign of phi. Predicting
+   across a temporal gap, or predicting a longer horizon than 8-step patches, would
+   at least require the model to know which way the series tends to turn.
+3. **Fix the progress metric.** Rank-normalise the prediction loss, or score against
+   a frozen target encoder, so MSE becomes comparable across runs and epochs. There
+   is currently no trustworthy scalar to tune against — see the epoch table above.
 4. Only then compare against 0.817 again. The number to care about is
-   bear-vs-kangaroo above 0.725.
+   bear-vs-kangaroo above 0.725, and it has not moved off 0.71 in any run yet.
+
+**Closed:** early-stopping at the MSE minimum was tested and is refuted — epoch 1
+probes at 0.735, exactly the untrained null, versus 0.765 at epoch 29.
 
 ## Layout
 
