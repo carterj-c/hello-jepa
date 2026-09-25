@@ -1,0 +1,34 @@
+{
+  "majority class (chance)": {
+    "acc": 0.6059758867726717,
+    "bear_vs_kang": 0.692239467849224
+  },
+  "window-mean": {
+    "acc": 0.6437183295474401,
+    "bear_vs_kang": 0.6953436807095343
+  },
+  "vol only": {
+    "acc": 0.6704525598462345,
+    "bear_vs_kang": 0.692239467849224
+  },
+  "vol + lag1 autocorr": {
+    "acc": 0.6905469159531714,
+    "bear_vs_kang": 0.797339246119734
+  },
+  "mean + vol + autocorr": {
+    "acc": 0.69124585007863,
+    "bear_vs_kang": 0.78980044345898
+  },
+  "raw flattened window": {
+    "acc": 0.8168792591298271,
+    "bear_vs_kang": 0.7254988913525499
+  },
+  "HMM (windowed, causal)": {
+    "acc": 0.7122138738423903,
+    "bear_vs_kang": 0.5006651884700665
+  },
+  "HMM (full Viterbi, non-causal)": {
+    "acc": 0.7197274156910711,
+    "bear_vs_kang": 0.4957871396895787
+  }
+}
